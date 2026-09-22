@@ -45,6 +45,16 @@ class PlaywrightBootstrapBrowser:
         return await self._page.locator(self.CHAT_LIST).count() > 0
 
     async def screenshot(self, path: Path) -> None:
+        # Telegram Web paints the login UI asynchronously after DOMContentLoaded.
+        # Wait for meaningful UI instead of capturing the initial blank shell.
+        await self._page.wait_for_function(
+            """() => document.body && (
+                document.querySelector('canvas, svg') ||
+                document.body.innerText.trim().length > 20
+            )""",
+            timeout=30_000,
+        )
+        await self._page.wait_for_timeout(1_500)
         await self._page.screenshot(path=str(path), full_page=False)
 
     async def wait_for_login(self) -> None:
@@ -136,9 +146,11 @@ async def bootstrap(
         screenshot_path.chmod(0o600)
         print(
             f"Login screenshot written securely to {screenshot_path}; "
-            "scan it, then run --check-login"
+            "scan it while this process remains open."
         )
-        return 1
+        await browser.wait_for_login()
+        print("Telegram Web login saved")
+        return 0
     finally:
         await browser.close()
 

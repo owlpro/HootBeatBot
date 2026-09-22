@@ -1,4 +1,5 @@
 .env
+config/topics.yml
 .venv/
 __pycache__/
 *.py[cod]

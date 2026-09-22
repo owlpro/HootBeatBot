@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import os
 from pathlib import Path
@@ -37,6 +38,9 @@ async def test_headless_bootstrap_writes_private_login_screenshot(
     screenshot = tmp_path / "private" / "login.png"
     closed = False
 
+    waited = False
+    screenshot_calls = 0
+
     class Browser:
         async def open(self, url: str) -> None:
             assert url == "https://web.telegram.org/k/"
@@ -45,10 +49,14 @@ async def test_headless_bootstrap_writes_private_login_screenshot(
             return False
 
         async def screenshot(self, path: Path) -> None:
-            path.write_bytes(b"not-a-real-login")
+            nonlocal screenshot_calls
+            screenshot_calls += 1
+            path.write_bytes(f"login-{screenshot_calls}".encode())
 
         async def wait_for_login(self) -> None:
-            raise AssertionError("headless mode must not wait indefinitely")
+            nonlocal waited
+            waited = True
+            await asyncio.sleep(0.02)
 
         async def close(self) -> None:
             nonlocal closed
@@ -67,10 +75,11 @@ async def test_headless_bootstrap_writes_private_login_screenshot(
         screenshot_path=screenshot,
         check_login=False,
     )
-    assert result == 1
+    assert result == 0
     assert screenshot.exists()
     assert os.stat(screenshot.parent).st_mode & 0o777 == 0o700
     assert os.stat(screenshot).st_mode & 0o777 == 0o600
+    assert waited
     assert closed
 
 
