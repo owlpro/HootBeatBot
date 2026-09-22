@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "telegram-music-bridge"
+version = "0.1.0"
+description = "Daily Telegram source-bot to forum-topic music bridge"
+requires-python = ">=3.11"
+dependencies = [
+  "aiogram>=3.13,<4",
+  "playwright==1.55.0",
+  "apscheduler>=3.10,<4",
+  "sqlalchemy[asyncio]>=2.0,<3",
+  "aiosqlite>=0.20,<1",
+  "pydantic-settings>=2.5,<3",
+  "PyYAML>=6,<7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9", "pytest-asyncio>=0.24,<1", "ruff>=0.6,<1", "mypy>=1.11,<2"]
+
+[project.scripts]
+music-bridge = "music_bridge.main:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "S"]
+ignore = ["S101", "ASYNC240"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+mypy_path = "src"
+packages = ["music_bridge"]
+
+[[tool.mypy.overrides]]
+module = ["apscheduler.*", "yaml"]
+ignore_missing_imports = true

@@ -1,0 +1,32 @@
+services:
+  bridge:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    init: true
+    read_only: true
+    volumes:
+      - bridge-data:/data/state
+      - telegram-profile:/data/telegram-web-profile
+      - ./config/topics.yml:/app/config/topics.yml:ro
+    tmpfs:
+      - /app/var/tmp:uid=10001,gid=10001,mode=0700
+      - /tmp:uid=10001,gid=10001,mode=0700
+    healthcheck:
+      test: ["CMD", "music-bridge", "--check-config"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    shm_size: "256mb"
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  bridge-data:
+  telegram-profile:
