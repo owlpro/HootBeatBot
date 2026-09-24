@@ -1,13 +1,19 @@
 import asyncio
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-from music_bridge.scheduler import ActiveJobRegistry, canonical_occurrence, register_topic_jobs
-from music_bridge.settings import TopicConfig
+from music_bridge.scheduler import (
+    ActiveJobRegistry,
+    canonical_occurrence,
+    canonical_rotation_occurrence,
+    register_topic_jobs,
+    rotation_topic_for_occurrence,
+)
+from music_bridge.settings import RotationSchedule, TopicConfig
 
 
 async def runner(topic: TopicConfig, scheduled_for: datetime) -> str:
@@ -88,6 +94,113 @@ def test_registered_job_passes_canonical_occurrence() -> None:
     asyncio.run(job.func())
     local = observed[0].astimezone(ZoneInfo(configured.timezone))
     assert (local.hour, local.minute, local.second, local.microsecond) == (9, 15, 0, 0)
+
+
+def test_rotation_registers_one_hourly_job_and_removes_daily_topic_jobs() -> None:
+    scheduler = AsyncIOScheduler(timezone=ZoneInfo("Asia/Tehran"))
+    configured = [topic("rock"), topic("jazz")]
+    register_topic_jobs(scheduler, configured, runner)
+
+    register_topic_jobs(
+        scheduler,
+        configured,
+        runner,
+        rotation_schedule=RotationSchedule(enabled=True),
+    )
+
+    jobs = scheduler.get_jobs()
+    assert [job.id for job in jobs] == ["topic-rotation"]
+    trigger: Any = jobs[0].trigger
+    assert str(trigger.fields[5]) == "*"
+    assert str(trigger.fields[6]) == "5,35"
+    assert str(trigger.timezone) == "Asia/Tehran"
+    assert jobs[0].coalesce is True
+    assert jobs[0].max_instances == 1
+    assert 0 < jobs[0].misfire_grace_time <= 3600
+
+
+def test_disabling_rotation_restores_daily_jobs_and_removes_rotation_job() -> None:
+    scheduler = AsyncIOScheduler(timezone=ZoneInfo("Asia/Tehran"))
+    configured = [topic("rock"), topic("jazz")]
+    register_topic_jobs(
+        scheduler,
+        configured,
+        runner,
+        rotation_schedule=RotationSchedule(enabled=True),
+    )
+
+    register_topic_jobs(scheduler, configured, runner, rotation_schedule=RotationSchedule())
+
+    assert {job.id for job in scheduler.get_jobs()} == {"topic:rock", "topic:jazz"}
+
+
+def test_rotation_has_48_exact_fair_slots_without_adjacent_repeats() -> None:
+    schedule = RotationSchedule(enabled=True)
+    configured = [topic("rock"), topic("jazz"), topic("pop")]
+    zone = ZoneInfo(schedule.timezone)
+    slots = [
+        datetime.combine(date(2026, 9, 23), datetime.min.time(), zone)
+        + timedelta(hours=hour, minutes=minute)
+        for hour in range(24)
+        for minute in schedule.minutes
+    ]
+
+    selected = [rotation_topic_for_occurrence(configured, schedule, slot).name for slot in slots]
+
+    assert len(selected) == 48
+    assert all(left != right for left, right in zip(selected, selected[1:], strict=False))
+    assert {name: selected.count(name) for name in set(selected)} == {
+        "rock": 16,
+        "jazz": 16,
+        "pop": 16,
+    }
+
+
+def test_rotation_uses_absolute_slot_number_across_dates() -> None:
+    schedule = RotationSchedule(enabled=True)
+    configured = [topic("rock"), topic("jazz"), topic("pop"), topic("folk"), topic("dance")]
+    zone = ZoneInfo(schedule.timezone)
+    first = datetime(2026, 9, 23, 0, 5, tzinfo=zone)
+    next_day = first + timedelta(days=1)
+
+    first_name = rotation_topic_for_occurrence(configured, schedule, first).name
+    next_name = rotation_topic_for_occurrence(configured, schedule, next_day).name
+
+    assert first_name != next_name  # 48 slots/day leaves an extra rotation of three.
+
+
+def test_rotation_canonical_occurrence_is_exact_latest_slot() -> None:
+    schedule = RotationSchedule(enabled=True)
+    now = datetime(2026, 9, 23, 10, 34, 59, 999, tzinfo=ZoneInfo("Asia/Tehran"))
+
+    occurrence = canonical_rotation_occurrence(schedule, now)
+
+    assert occurrence == datetime(2026, 9, 23, 10, 5, tzinfo=ZoneInfo("Asia/Tehran")).astimezone(
+        UTC
+    )
+
+
+def test_rotation_job_passes_selected_topic_and_exact_slot() -> None:
+    observed: list[tuple[str, datetime]] = []
+
+    async def observe(current: TopicConfig, scheduled_for: datetime) -> str:
+        observed.append((current.name, scheduled_for))
+        return "ok"
+
+    schedule = RotationSchedule(enabled=True)
+    configured = [topic("rock"), topic("jazz")]
+    scheduler = AsyncIOScheduler(timezone=ZoneInfo("Asia/Tehran"))
+    register_topic_jobs(scheduler, configured, observe, rotation_schedule=schedule)
+
+    job = scheduler.get_job("topic-rotation")
+    assert job is not None
+    asyncio.run(job.func())
+
+    name, occurrence = observed[0]
+    assert name == rotation_topic_for_occurrence(configured, schedule, occurrence).name
+    local = occurrence.astimezone(ZoneInfo(schedule.timezone))
+    assert local.minute in schedule.minutes
+    assert local.second == local.microsecond == 0
 
 
 def test_scheduled_job_logs_only_failure_class(caplog) -> None:

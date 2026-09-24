@@ -1,6 +1,7 @@
 .git
 .venv
 .env
+config/topics.yml
 *.session*
 __pycache__
 .pytest_cache

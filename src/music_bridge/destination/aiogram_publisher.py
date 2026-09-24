@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from html import escape
 from typing import Any, Protocol
 
 from aiogram.types import FSInputFile
@@ -17,32 +16,29 @@ class BotLike(Protocol):
 
 
 class AiogramPublisher:
-    def __init__(self, bot: BotLike, source_username: str) -> None:
+    def __init__(self, bot: BotLike) -> None:
         self._bot = bot
-        self._source = source_username
-
-    def _caption(self, media: DownloadedMedia, genre: str) -> str:
-        title = escape(media.source.title or media.source.file_name or "Unknown track")
-        performer = escape(media.source.performer or "Unknown artist")
-        return (
-            f"<b>{title}</b> — {performer}\nGenre: {escape(genre)}\nSource: {escape(self._source)}"
-        )
 
     async def publish(
         self, chat_id: int, thread_id: int, media: DownloadedMedia, genre: str
     ) -> int:
+        del genre
         common = {
             "chat_id": chat_id,
-            "message_thread_id": thread_id,
-            "caption": self._caption(media, genre),
-            "parse_mode": "HTML",
         }
+        if thread_id != 1:
+            common["message_thread_id"] = thread_id
         upload = FSInputFile(media.path, filename=media.source.file_name or media.path.name)
         if media.source.kind is MediaKind.AUDIO:
+            audio_metadata: dict[str, Any] = {
+                "title": media.source.title,
+                "performer": media.source.performer,
+            }
+            if media.source.duration_seconds is not None:
+                audio_metadata["duration"] = media.source.duration_seconds
             message = await self._bot.send_audio(
                 audio=upload,
-                title=media.source.title,
-                performer=media.source.performer,
+                **audio_metadata,
                 **common,
             )
         else:

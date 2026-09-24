@@ -13,11 +13,12 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from music_bridge.service import safe_exception_category
-from music_bridge.settings import TopicConfig
+from music_bridge.settings import RotationSchedule, TopicConfig
 
 TopicRunner = Callable[[TopicConfig, datetime], Awaitable[str]]
 logger = logging.getLogger(__name__)
 MISFIRE_GRACE_SECONDS = 3600
+ROTATION_JOB_ID = "topic-rotation"
 
 
 class ActiveJobRegistry:
@@ -62,15 +63,92 @@ def canonical_occurrence(topic: TopicConfig, now: datetime | None = None) -> dat
     return occurrence.astimezone(UTC)
 
 
+def canonical_rotation_occurrence(
+    schedule: RotationSchedule, now: datetime | None = None
+) -> datetime:
+    """Return the exact latest configured hourly slot not later than ``now``."""
+    zone = ZoneInfo(schedule.timezone)
+    local_now = (now or datetime.now(UTC)).astimezone(zone)
+    eligible = [minute for minute in schedule.minutes if minute <= local_now.minute]
+    if eligible:
+        occurrence = local_now.replace(
+            minute=eligible[-1],
+            second=0,
+            microsecond=0,
+        )
+    else:
+        previous_hour = local_now - timedelta(hours=1)
+        occurrence = previous_hour.replace(
+            minute=schedule.minutes[-1],
+            second=0,
+            microsecond=0,
+        )
+    return occurrence.astimezone(UTC)
+
+
+def rotation_topic_for_occurrence(
+    topics: Iterable[TopicConfig], schedule: RotationSchedule, occurrence: datetime
+) -> TopicConfig:
+    """Select an enabled topic from an absolute slot number without daily resets."""
+    enabled = [topic for topic in topics if topic.enabled]
+    if not enabled:
+        raise ValueError("rotation requires an enabled topic")
+    local = occurrence.astimezone(ZoneInfo(schedule.timezone))
+    try:
+        minute_index = schedule.minutes.index(local.minute)
+    except ValueError:
+        raise ValueError("occurrence is not a configured rotation slot") from None
+    slots_per_hour = len(schedule.minutes)
+    absolute_slot = (
+        local.date().toordinal() * 24 * slots_per_hour + local.hour * slots_per_hour + minute_index
+    )
+    return enabled[absolute_slot % len(enabled)]
+
+
 def register_topic_jobs(
     scheduler: AsyncIOScheduler,
     topics: Iterable[TopicConfig],
     runner: TopicRunner,
     active_jobs: ActiveJobRegistry | None = None,
+    rotation_schedule: RotationSchedule | None = None,
 ) -> None:
     """Reconcile deterministic daily jobs; missed runs coalesce and never overlap."""
     topic_list = list(topics)
     registry = active_jobs or ActiveJobRegistry()
+    if rotation_schedule is not None and rotation_schedule.enabled:
+        for job in scheduler.get_jobs():
+            if job.id.startswith("topic:"):
+                scheduler.remove_job(job.id)
+
+        async def run_rotation() -> None:
+            try:
+                occurrence = canonical_rotation_occurrence(rotation_schedule)
+                current = rotation_topic_for_occurrence(topic_list, rotation_schedule, occurrence)
+                await registry.run(lambda: runner(current, occurrence))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("scheduled rotation job failed (%s)", safe_exception_category(exc))
+
+        if scheduler.get_job(ROTATION_JOB_ID) is not None:
+            scheduler.remove_job(ROTATION_JOB_ID)
+        scheduler.add_job(
+            run_rotation,
+            CronTrigger(
+                hour="*",
+                minute=",".join(str(minute) for minute in rotation_schedule.minutes),
+                timezone=ZoneInfo(rotation_schedule.timezone),
+            ),
+            id=ROTATION_JOB_ID,
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=MISFIRE_GRACE_SECONDS,
+        )
+        return
+
+    if scheduler.get_job(ROTATION_JOB_ID) is not None:
+        scheduler.remove_job(ROTATION_JOB_ID)
     desired = {f"topic:{topic.name}" for topic in topic_list if topic.enabled}
     for job in scheduler.get_jobs():
         if job.id.startswith("topic:") and job.id not in desired:

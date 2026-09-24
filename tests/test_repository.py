@@ -48,6 +48,27 @@ async def test_track_hash_deduplication_and_success_recording(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
+async def test_repository_returns_used_source_message_ids(tmp_path: Path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
+    await database.create_schema()
+    repo = Repository(database.session_factory)
+    for source_id, digest in [(71, "a" * 64), (72, "b" * 64)]:
+        await repo.add_track(
+            source_chat_id=-1,
+            source_message_id=source_id,
+            content_sha256=digest,
+            title=None,
+            performer=None,
+            file_name="track.mp3",
+            mime_type="audio/mpeg",
+            file_size=3,
+        )
+
+    assert await repo.get_used_source_message_ids() == frozenset({71, 72})
+    await database.dispose()
+
+
+@pytest.mark.asyncio
 async def test_hash_claim_is_atomic_and_associates_delivery_before_publish(tmp_path: Path) -> None:
     database = Database(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
     await database.create_schema()

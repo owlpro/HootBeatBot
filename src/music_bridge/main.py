@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import signal
 import sys
 from collections.abc import Callable, Sequence
@@ -20,12 +21,31 @@ from music_bridge.moderation import ForumModerator
 from music_bridge.repositories import Repository
 from music_bridge.scheduler import ActiveJobRegistry, create_scheduler, register_topic_jobs
 from music_bridge.service import BridgeOperationalError, BridgeService, safe_exception_category
-from music_bridge.settings import GroupConfig, Settings, TopicConfig, load_config
-from music_bridge.source.playwright_source import (
-    PlaywrightMusicSource,
-    PlaywrightTelegramWebDriver,
-    TelegramWebDriver,
+from music_bridge.settings import GroupConfig, RotationSchedule, Settings, TopicConfig, load_config
+from music_bridge.source.soundcloud_catalog import (
+    CatalogCache,
+    CatalogMusicSource,
+    PublicChromiumSoundCloudCollector,
+    SoundCloudCatalogManager,
 )
+from music_bridge.source.soundcloud_source import (
+    AsyncCommandRunner,
+    SoundCloudMusicSource,
+    canonical_track_url,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _enabled_catalog_queries(topics: Sequence[TopicConfig]) -> list[str]:
+    queries = (
+        query
+        for topic in topics
+        if topic.enabled
+        for query in topic.render_catalog_queries()
+        if canonical_track_url(query) is None
+    )
+    return list(dict.fromkeys(queries))
 
 
 class PollingLifecycle:
@@ -80,6 +100,21 @@ class PollingLifecycle:
         await self._task
 
 
+async def start_moderation(
+    bot: Any, groups: list[GroupConfig], *, enabled: bool
+) -> PollingLifecycle | None:
+    """Start moderation polling only when the administrative feature is enabled."""
+    if not enabled:
+        return None
+    dispatcher = Dispatcher()
+    me = await bot.get_me()
+    moderator = ForumModerator(bot, groups, bot_id=me.id)
+    dispatcher.message.register(moderator.handle)
+    polling = PollingLifecycle(dispatcher, bot)
+    polling.start()
+    return polling
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Telegram topic daily music bridge")
     modes = result.add_mutually_exclusive_group()
@@ -103,64 +138,110 @@ async def _build_and_run(
     topics: list[TopicConfig],
     once: str | None,
     groups: list[GroupConfig] | None = None,
+    moderation_enabled: bool = False,
+    rotation_schedule: RotationSchedule | None = None,
 ) -> None:
     Path("var/tmp").mkdir(parents=True, exist_ok=True, mode=0o700)
     database = Database(settings.database_url)
-    web_driver: PlaywrightTelegramWebDriver | None = None
     bot: Bot | None = None
     polling: PollingLifecycle | None = None
     scheduler: Any | None = None
+    catalog_task: asyncio.Task[None] | None = None
     active_jobs = ActiveJobRegistry()
     cleanup_error: BaseException | None = None
     try:
         await database.create_schema()
         repository = Repository(database.session_factory)
         await repository.recover_nonterminal()
-        web_driver = await PlaywrightTelegramWebDriver.launch(
-            settings.telegram_web_profile_path, headless=True
-        )
-        if not await web_driver.check_login(settings.telegram_web_url):
-            raise RuntimeError("Telegram Web profile is not logged in; run the bootstrap script")
         bot = Bot(settings.destination_bot_token.get_secret_value())
-        source = PlaywrightMusicSource(
-            cast(TelegramWebDriver, web_driver),
-            settings.telegram_web_url,
-            settings.source_bot_username,
+        direct_source = SoundCloudMusicSource(
+            AsyncCommandRunner(),
+            download_root=Path("var/tmp/source"),
             timeout_seconds=settings.source_response_timeout_seconds,
             max_media_bytes=settings.max_media_bytes,
+            min_duration_seconds=settings.soundcloud_min_duration_seconds,
+            search_limit=settings.soundcloud_search_limit,
+        )
+        catalog_cache = CatalogCache(settings.soundcloud_catalog_path)
+        selected = next((topic for topic in topics if topic.name == once), None)
+        if once is not None and selected is None:
+            raise ValueError(f"unknown topic: {once}")
+        if selected is None:
+            catalog_queries = _enabled_catalog_queries(topics)
+        else:
+            catalog_queries = list(
+                dict.fromkeys(
+                    query
+                    for query in selected.render_catalog_queries()
+                    if canonical_track_url(query) is None
+                )
+            )
+        catalog_manager = SoundCloudCatalogManager(
+            catalog_cache,
+            PublicChromiumSoundCloudCollector(
+                chromium_executable=settings.chromium_executable_path,
+                page_timeout_seconds=settings.soundcloud_catalog_refresh_timeout_seconds,
+                result_limit=settings.soundcloud_search_limit,
+            ),
+            catalog_queries,
+            timeout_seconds=settings.soundcloud_catalog_refresh_timeout_seconds,
+        )
+        if catalog_queries:
+            await catalog_manager.refresh_or_load()
+            used_source_ids = await repository.get_used_source_message_ids()
+            capacity = catalog_cache.require_capacity(catalog_queries, used_source_ids)
+            logger.info("catalog usable capacity by query: %s", capacity)
+        source = CatalogMusicSource(
+            catalog_cache,
+            direct_source,
+            candidate_attempts=settings.soundcloud_candidate_attempts,
         )
         service = BridgeService(
             repository,
             cast(MusicSource, source),
             cast(
                 DestinationPublisher,
-                AiogramPublisher(cast(BotLike, bot), settings.source_bot_username),
+                AiogramPublisher(cast(BotLike, bot)),
             ),
             settings.max_media_bytes,
             Path("var/tmp"),
+            source_attempts=settings.soundcloud_candidate_attempts,
         )
         if once is not None:
-            selected = next((topic for topic in topics if topic.name == once), None)
-            if selected is None:
-                raise ValueError(f"unknown topic: {once}")
+            assert selected is not None
             occurrence = datetime.now(UTC).replace(second=0, microsecond=0)
             print(await service.run(selected, occurrence))
             return
-        dispatcher = Dispatcher()
-        me = await bot.get_me()
-        moderator = ForumModerator(cast(Any, bot), groups or [], bot_id=me.id)
-        dispatcher.message.register(moderator.handle)
-        polling = PollingLifecycle(dispatcher, bot)
-        polling.start()
         shutdown_event = asyncio.Event()
         install_signal_handlers(asyncio.get_running_loop(), shutdown_event)
+        if catalog_queries:
+            catalog_task = asyncio.create_task(
+                catalog_manager.run_periodic(
+                    settings.soundcloud_catalog_refresh_interval_seconds,
+                    shutdown_event,
+                )
+            )
+        polling = await start_moderation(bot, groups or [], enabled=moderation_enabled)
         scheduler = create_scheduler()
-        register_topic_jobs(scheduler, topics, service.run, active_jobs)
+        register_topic_jobs(
+            scheduler,
+            topics,
+            service.run,
+            active_jobs,
+            rotation_schedule=rotation_schedule,
+        )
         scheduler.start()
-        await polling.wait_for_shutdown(shutdown_event)
+        if polling is None:
+            await shutdown_event.wait()
+        else:
+            await polling.wait_for_shutdown(shutdown_event)
     finally:
         had_active_exception = sys.exc_info()[0] is not None
         active_jobs.stop_accepting()
+        if catalog_task is not None and not catalog_task.done():
+            catalog_task.cancel()
+        if catalog_task is not None:
+            await asyncio.gather(catalog_task, return_exceptions=True)
         if scheduler is not None:
             try:
                 scheduler.shutdown(wait=False)
@@ -180,11 +261,6 @@ async def _build_and_run(
                 await bot.session.close()
             except BaseException as exc:
                 cleanup_error = cleanup_error or exc
-        if web_driver is not None:
-            try:
-                await web_driver.close()
-            except BaseException as exc:
-                cleanup_error = cleanup_error or exc
         try:
             await database.dispose()
         except BaseException as exc:
@@ -201,7 +277,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.check_config:
         print(f"configuration valid: {len(topics)} topic(s)")
         return 0
-    asyncio.run(_build_and_run(settings, topics, args.run_once, config.groups))
+    asyncio.run(
+        _build_and_run(
+            settings,
+            topics,
+            args.run_once,
+            config.groups,
+            config.moderation_enabled,
+            config.rotation_schedule,
+        )
+    )
     return 0
 
 

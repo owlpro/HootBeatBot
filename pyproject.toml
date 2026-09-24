@@ -9,12 +9,13 @@ description = "Daily Telegram source-bot to forum-topic music bridge"
 requires-python = ">=3.11"
 dependencies = [
   "aiogram>=3.13,<4",
-  "playwright==1.55.0",
+  "yt-dlp==2026.8.19",
   "apscheduler>=3.10,<4",
   "sqlalchemy[asyncio]>=2.0,<3",
   "aiosqlite>=0.20,<1",
   "pydantic-settings>=2.5,<3",
   "PyYAML>=6,<7",
+  "playwright>=1.55,<2",
 ]
 
 [project.optional-dependencies]

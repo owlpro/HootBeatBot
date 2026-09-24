@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from string import Formatter
 from typing import Any
-from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
@@ -24,6 +22,8 @@ class TopicConfig(BaseModel):
     message_thread_id: int = Field(gt=0)
     genre: str = Field(min_length=1)
     request_template: str = "random {genre}"
+    catalog_query: str | None = Field(default=None, min_length=1)
+    catalog_queries: list[str] | None = Field(default=None, min_length=1)
     hour: int = Field(ge=0, le=23)
     minute: int = Field(ge=0, le=59)
     timezone: str = "Asia/Tehran"
@@ -59,6 +59,25 @@ class TopicConfig(BaseModel):
     def render_request(self) -> str:
         return self.request_template.format(genre=self.genre)
 
+    def render_catalog_query(self) -> str:
+        return self.render_catalog_queries()[0]
+
+    def render_catalog_queries(self) -> tuple[str, ...]:
+        if self.catalog_queries is not None:
+            return tuple(self.catalog_queries)
+        return (self.catalog_query or self.render_request(),)
+
+    @model_validator(mode="after")
+    def require_one_catalog_query_form(self) -> TopicConfig:
+        if self.catalog_query is not None and self.catalog_queries is not None:
+            raise ValueError("catalog_query and catalog_queries are mutually exclusive")
+        if self.catalog_queries is not None:
+            normalized = [query.strip() for query in self.catalog_queries]
+            if any(not query for query in normalized) or len(normalized) != len(set(normalized)):
+                raise ValueError("catalog_queries must be nonblank and unique")
+            self.catalog_queries = normalized
+        return self
+
 
 class GroupConfig(BaseModel):
     """Forum topics whose user text is redirected to General."""
@@ -83,10 +102,36 @@ class GroupConfig(BaseModel):
         return self
 
 
+class RotationSchedule(BaseModel):
+    """Hourly minute slots shared by a fair rotation of enabled topics."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    timezone: str = "Asia/Tehran"
+    minutes: list[int] = Field(default_factory=lambda: [5, 35], min_length=1)
+
+    @field_validator("timezone")
+    @classmethod
+    def require_timezone(cls, value: str) -> str:
+        return TopicConfig.require_timezone(value)
+
+    @field_validator("minutes")
+    @classmethod
+    def require_sorted_unique_minutes(cls, value: list[int]) -> list[int]:
+        if any(minute < 0 or minute > 59 for minute in value):
+            raise ValueError("rotation minutes must be between 0 and 59")
+        if value != sorted(set(value)):
+            raise ValueError("rotation minutes must be sorted and unique")
+        return value
+
+
 class TopicsFile(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     topics: list[TopicConfig] = Field(min_length=1)
+    rotation_schedule: RotationSchedule | None = None
+    moderation_enabled: bool = False
     groups: list[GroupConfig] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -96,6 +141,8 @@ class TopicsFile(BaseModel):
         if len(names) != len(set(names)) or len(routes) != len(set(routes)):
             raise ValueError("duplicate topic name or destination route")
         if not any(topic.enabled for topic in self.topics):
+            if self.rotation_schedule is not None and self.rotation_schedule.enabled:
+                raise ValueError("enabled rotation schedule requires at least one enabled topic")
             raise ValueError("at least one topic must be enabled")
         group_chats = [group.chat_id for group in self.groups]
         if len(group_chats) != len(set(group_chats)):
@@ -110,46 +157,19 @@ class Settings(BaseSettings):
         env_file=".env", env_prefix="", case_sensitive=False, extra="forbid"
     )
 
-    telegram_web_profile_path: Path
-    telegram_web_url: str = "https://web.telegram.org/k/"
-    telegram_login_screenshot_path: Path | None = None
     destination_bot_token: SecretStr
     topics_config_path: Path
-    source_bot_username: str = "@melobot"
-
     database_url: str = "sqlite+aiosqlite:///var/music_bridge.db"
-    source_response_timeout_seconds: int = Field(default=120, gt=0, le=600)
+    source_response_timeout_seconds: int = Field(default=180, gt=0, le=900)
     max_media_bytes: int = Field(default=50 * 1024 * 1024, gt=0)
+    soundcloud_min_duration_seconds: int = Field(default=60, ge=30, le=600)
+    soundcloud_search_limit: int = Field(default=50, ge=1, le=50)
+    soundcloud_catalog_path: Path = Path("/data/state/soundcloud-catalog.json")
+    soundcloud_catalog_refresh_interval_seconds: int = Field(default=21_600, ge=300, le=604_800)
+    soundcloud_catalog_refresh_timeout_seconds: int = Field(default=120, ge=10, le=900)
+    soundcloud_candidate_attempts: int = Field(default=3, ge=1, le=20)
+    chromium_executable_path: Path = Path("/usr/bin/chromium")
     log_level: str = "INFO"
-
-    @field_validator("source_bot_username")
-    @classmethod
-    def normalize_source_username(cls, value: str) -> str:
-        normalized = value.strip()
-        if not normalized.startswith("@"):
-            normalized = f"@{normalized}"
-        if re.fullmatch(
-            r"@[A-Za-z0-9_]{5,32}", normalized
-        ) is None or not normalized.lower().endswith("bot"):
-            raise ValueError("source_bot_username must be a valid Telegram bot username")
-        return normalized
-
-    @field_validator("telegram_web_profile_path", "telegram_login_screenshot_path")
-    @classmethod
-    def require_absolute_private_path(cls, value: Path | None) -> Path | None:
-        if value is None:
-            return None
-        if not value.is_absolute():
-            raise ValueError("private paths must be absolute")
-        return value
-
-    @field_validator("telegram_web_url")
-    @classmethod
-    def require_official_web_url(cls, value: str) -> str:
-        parsed = urlparse(value)
-        if parsed.scheme != "https" or parsed.hostname != "web.telegram.org":
-            raise ValueError("telegram_web_url must use official Telegram Web over HTTPS")
-        return value
 
     @field_validator("destination_bot_token", mode="before")
     @classmethod

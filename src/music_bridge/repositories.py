@@ -58,6 +58,11 @@ class Repository:
             )
             return result is not None
 
+    async def get_used_source_message_ids(self) -> frozenset[int]:
+        async with self._sessions() as session:
+            result = await session.scalars(select(TrackRow.source_message_id))
+            return frozenset(result.all())
+
     async def add_track(
         self,
         *,

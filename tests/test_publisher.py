@@ -26,7 +26,17 @@ def downloaded(tmp_path: Path, kind: MediaKind = MediaKind.AUDIO) -> DownloadedM
     path = tmp_path / "song.mp3"
     path.write_bytes(b"abc")
     return DownloadedMedia(
-        source=SourceMedia(1, 2, kind, "song.mp3", "audio/mpeg", 3, "<Title>", "A & B"),
+        source=SourceMedia(
+            1,
+            2,
+            kind,
+            "song.mp3",
+            "audio/mpeg",
+            3,
+            "<Title>",
+            "A & B",
+            duration_seconds=598,
+        ),
         path=path,
         size=3,
         sha256="a" * 64,
@@ -34,9 +44,9 @@ def downloaded(tmp_path: Path, kind: MediaKind = MediaKind.AUDIO) -> DownloadedM
 
 
 @pytest.mark.asyncio
-async def test_publisher_routes_audio_to_exact_topic_and_escapes_caption(tmp_path: Path) -> None:
+async def test_publisher_routes_audio_to_exact_topic_without_caption(tmp_path: Path) -> None:
     bot = FakeBot()
-    publisher = AiogramPublisher(bot, "@source")
+    publisher = AiogramPublisher(bot)
     message_id = await publisher.publish(-1001234567890, 99, downloaded(tmp_path), "R&B")
     assert message_id == 42
     assert bot.audio is not None
@@ -44,15 +54,26 @@ async def test_publisher_routes_audio_to_exact_topic_and_escapes_caption(tmp_pat
     assert bot.audio["message_thread_id"] == 99
     assert bot.audio["title"] == "<Title>"
     assert bot.audio["performer"] == "A & B"
-    assert "R&amp;B" in bot.audio["caption"]
-    assert "&lt;Title&gt;" in bot.audio["caption"]
-    assert bot.audio["parse_mode"] == "HTML"
+    assert bot.audio["duration"] == 598
+    assert "caption" not in bot.audio
+    assert "parse_mode" not in bot.audio
+
+
+@pytest.mark.asyncio
+async def test_publisher_omits_thread_id_for_general_topic(tmp_path: Path) -> None:
+    bot = FakeBot()
+    publisher = AiogramPublisher(bot)
+
+    await publisher.publish(-1001234567890, 1, downloaded(tmp_path), "general")
+
+    assert bot.audio is not None
+    assert "message_thread_id" not in bot.audio
 
 
 @pytest.mark.asyncio
 async def test_publisher_uses_document_for_document_media(tmp_path: Path) -> None:
     bot = FakeBot()
-    publisher = AiogramPublisher(bot, "@source")
+    publisher = AiogramPublisher(bot)
     message_id = await publisher.publish(
         -1001234567890, 99, downloaded(tmp_path, MediaKind.DOCUMENT), "jazz"
     )

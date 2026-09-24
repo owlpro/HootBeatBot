@@ -1,24 +1,130 @@
+moderation_enabled: false
+
+rotation_schedule:
+  enabled: true
+  timezone: Asia/Tehran
+  minutes: [5, 35]
+
 groups:
   - chat_id: -1001234567890
     general_thread_id: 1
-    specialist_thread_ids: [101, 102]
+    specialist_thread_ids: [101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112]
 
 topics:
-  - name: rock
+  - name: general
+    chat_id: -1001234567890
+    message_thread_id: 1
+    genre: general
+    catalog_query: general music
+    request_template: "{genre}"
+    hour: 0
+    minute: 0
+    enabled: false
+  - name: house
     chat_id: -1001234567890
     message_thread_id: 101
-    genre: alternative rock
-    request_template: "random {genre}"
-    hour: 9
-    minute: 0
-    timezone: Asia/Tehran
+    genre: house
+    catalog_query: popular house music
+    hour: 0
+    minute: 5
     enabled: true
-  - name: jazz
+  - name: rap_fa
     chat_id: -1001234567890
     message_thread_id: 102
-    genre: jazz
-    request_template: "random {genre}"
-    hour: 18
-    minute: 30
-    timezone: Asia/Tehran
+    genre: Persian rap
+    catalog_query: popular Persian rap 2026
+    hour: 1
+    minute: 5
+    enabled: true
+  - name: rock
+    chat_id: -1001234567890
+    message_thread_id: 103
+    genre: alternative rock
+    catalog_query: popular alternative rock
+    hour: 2
+    minute: 5
+    enabled: true
+  - name: hiphop
+    chat_id: -1001234567890
+    message_thread_id: 104
+    genre: hip hop
+    catalog_query: popular independent hip hop
+    hour: 3
+    minute: 5
+    enabled: true
+  - name: g_old
+    chat_id: -1001234567890
+    message_thread_id: 105
+    genre: old goldies
+    catalog_query: classic oldies hits
+    hour: 4
+    minute: 5
+    enabled: true
+  - name: pop
+    chat_id: -1001234567890
+    message_thread_id: 106
+    genre: pop
+    catalog_queries:
+      - Dua Lipa
+      - The Weeknd
+      - Billie Eilish
+      - Ariana Grande
+      - Taylor Swift
+      - Ed Sheeran
+    hour: 5
+    minute: 5
+    enabled: true
+  - name: classic_instrumental
+    chat_id: -1001234567890
+    message_thread_id: 107
+    genre: classical instrumental
+    catalog_query: popular classical instrumental
+    hour: 6
+    minute: 5
+    enabled: true
+  - name: remix
+    chat_id: -1001234567890
+    message_thread_id: 108
+    genre: Persian and international remix
+    catalog_queries:
+      - popular Persian remix
+      - popular international remix
+    hour: 7
+    minute: 5
+    enabled: true
+  - name: persian_pop_30
+    chat_id: -1001234567890
+    message_thread_id: 109
+    genre: Persian pop
+    catalog_query: popular Persian pop
+    hour: 8
+    minute: 5
+    enabled: true
+  - name: arabic
+    chat_id: -1001234567890
+    message_thread_id: 110
+    genre: Arabic music
+    catalog_query: popular Arabic music
+    hour: 9
+    minute: 5
+    enabled: true
+  - name: turkey
+    chat_id: -1001234567890
+    message_thread_id: 112
+    genre: Turkish pop
+    catalog_queries:
+      - Tarkan
+      - Turkish pop
+      - Mabel Matiz
+      - Simge
+    hour: 10
+    minute: 5
+    enabled: true
+  - name: dance
+    chat_id: -1001234567890
+    message_thread_id: 111
+    genre: dance
+    catalog_query: popular dance music
+    hour: 10
+    minute: 5
     enabled: false

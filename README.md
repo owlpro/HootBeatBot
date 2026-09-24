@@ -1,110 +1,160 @@
-# Telegram Topic Daily Music Bridge
+# HootBeatBot — Direct SoundCloud Music Bridge
 
-A single-process MVP that uses a persistent Playwright/Chromium Telegram Web user profile to ask a configurable source bot (default `@melobot`) for music, then uploads the downloaded file with an aiogram Bot API bot to an exact forum topic. The same aiogram polling process moderates configured specialist topics by moving non-media user messages to General.
+HootBeatBot builds a public SoundCloud search catalog with ephemeral Chromium, downloads selected tracks with `yt-dlp`, validates the resulting MP3 with `ffprobe`, deduplicates it with SHA-256, and uploads it with Telegram Bot API to an exact forum Topic.
 
-> Telegram Web automation and media redistribution may be restricted by Telegram, the source bot, or copyright law. Confirm permission before deployment. A Bot API bot cannot receive another bot's messages, which is why the source uses a separate logged-in web profile.
+Chromium is used only for unauthenticated public SoundCloud search. It has no persistent browser profile, login, cookies, or Telegram access. No personal Telegram account or Telegram API ID/hash is used.
 
-## Behavior
+## Pipeline
 
-- Source requests are serialized per process.
-- Search results are scoped to Telegram Web's result containers; the exact canonical username must match both the selected result and the opened chat header before a query is sent.
-- The outbound query message ID is recorded. Responses must follow it in DOM order, explicit reply IDs are preferred, and observed IDs remain consumed across timeout/cancellation. If Telegram Web omits reply IDs, an unassociated media message arriving after the outbound query remains a residual association risk.
-- The source session remains serialized through the complete download. Chromium downloads into a dedicated per-request directory whose growth is polled during transfer; oversized downloads are cancelled and all partial files are removed before any complete file is exposed.
-- Delivery is deduplicated with SHA-256 and persisted in async SQLite before publishing.
-- Daily APScheduler jobs use explicit topic/time-zone mappings.
-- aiogram polling runs alongside the scheduler.
-- For configured specialist topics, photo, video, audio, document, voice, video note, animation, sticker, and (when supplied by aiogram) paid media are left in place. Non-media user messages are forwarded to the configured General `message_thread_id`; the original is deleted only after Telegram returns a valid forwarded message ID.
-- General-topic messages, other topics, service messages, bots, this bot, and media are ignored to prevent loops.
+```text
+public SoundCloud search in ephemeral Chromium
+  -> atomic /data/state catalog cache
+  -> highest-ranked unused URL (popularity + recency)
+  -> yt-dlp metadata inspection
+  -> reject previews shorter than the configured minimum
+  -> download and convert to MP3
+  -> ffprobe format/duration validation
+  -> byte-size bound + MP3 signature check
+  -> SHA-256 deduplication
+  -> Bot API upload to exact chat_id/message_thread_id
+```
+
+The outgoing Telegram audio has title and performer metadata but no caption/description.
+
+## Runtime behavior
+
+- Direct `https://soundcloud.com/...` URLs remain supported for `--run-once` and bypass the catalog.
+- Scheduled queries select the highest-ranked unused URL from the cache; failed candidates are rejected and the next bounded candidate is tried.
+- The browser refreshes once at startup and every six hours by default. Delivery never launches Chromium. A failed refresh uses an existing valid cache and fails closed if no valid cache exists.
+- Audio shorter than `SOUNDCLOUD_MIN_DURATION_SECONDS` is rejected.
+- Actual MP3 duration must match SoundCloud metadata within 8 seconds or 3%, whichever is larger.
+- The downloaded file must be an MP3, have a valid MP3 signature, and stay below `MAX_MEDIA_BYTES`.
+- Temporary source and upload files are removed after success or failure.
+- SHA-256 content deduplication is persisted in SQLite before publishing.
+- Scheduled jobs route only to explicitly configured forum Topics.
+- Optional moderation uses the same Bot API bot and does not require a personal account.
+
+Only download and redistribute media you are permitted to use. SoundCloud extractor behavior can change, so keep `yt-dlp` current and verify after upgrades.
 
 ## Setup
 
-Python 3.11 or newer is supported. Playwright and its Chromium build are pinned together at `1.55.0`.
+Python 3.11+, system Chromium, and `ffmpeg`/`ffprobe` are required. Docker installs these dependencies.
 
 ```bash
-python3.11 -m venv .venv
+python3 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
-.venv/bin/playwright install chromium
 cp .env.example .env
 chmod 600 .env
 cp config/topics.example.yml config/topics.yml
 ```
 
-Set an absolute `TELEGRAM_WEB_PROFILE_PATH`, `DESTINATION_BOT_TOKEN`, and `TOPICS_CONFIG_PATH`. The default `TELEGRAM_WEB_URL=https://web.telegram.org/k/` is restricted by validation to official HTTPS Telegram Web. No Telegram API ID/hash is used.
+Required environment values:
 
-In `config/topics.yml`, `topics` controls scheduled deliveries. `groups` controls moderation:
+```env
+DESTINATION_BOT_TOKEN=123456789:replace-me
+DATABASE_URL=sqlite+aiosqlite:////data/state/music_bridge.db
+TOPICS_CONFIG_PATH=/app/config/topics.yml
+SOURCE_RESPONSE_TIMEOUT_SECONDS=180
+MAX_MEDIA_BYTES=52428800
+SOUNDCLOUD_MIN_DURATION_SECONDS=60
+SOUNDCLOUD_SEARCH_LIMIT=50
+SOUNDCLOUD_CATALOG_PATH=/data/state/soundcloud-catalog.json
+SOUNDCLOUD_CATALOG_REFRESH_INTERVAL_SECONDS=21600
+SOUNDCLOUD_CATALOG_REFRESH_TIMEOUT_SECONDS=120
+SOUNDCLOUD_CANDIDATE_ATTEMPTS=3
+CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+```
+
+No `TELEGRAM_WEB_*`, user session, phone number, login code, or 2FA value is needed.
+
+## Topic configuration
+
+A Topic can use a direct SoundCloud URL for an exact one-off selection or an explicit public catalog query for recurring discovery:
 
 ```yaml
+moderation_enabled: false
+
+rotation_schedule:
+  enabled: true
+  timezone: Asia/Tehran
+  minutes: [5, 35]
+
 groups:
   - chat_id: -1001234567890
     general_thread_id: 1
-    specialist_thread_ids: [101, 102]
+    specialist_thread_ids: [4, 7]
+
+topics:
+  - name: rock
+    chat_id: -1001234567890
+    message_thread_id: 4
+    genre: "https://soundcloud.com/artist/full-rock-track"
+    request_template: "{genre}"
+    hour: 12
+    minute: 0
+    timezone: Asia/Tehran
+    enabled: true
+
+  - name: house
+    chat_id: -1001234567890
+    message_thread_id: 2
+    genre: "independent progressive house free download"
+    catalog_query: "popular progressive house"
+    hour: 12
+    minute: 5
+    timezone: Asia/Tehran
+    enabled: true
 ```
 
-Group and route IDs must be exact Bot API IDs. Each configured chat must be a forum supergroup.
+Group and route IDs must be exact Bot API IDs. The destination must be a forum supergroup.
 
-## Secure Telegram Web login
-
-The bootstrap command accepts no phone number, login code, 2FA value, or password. Authentication happens only in Telegram Web. It applies umask `077`, enforces profile-directory mode `0700`, and writes QR/login screenshots with mode `0600` in a `0700` directory.
-
-Headed login when `DISPLAY` is available:
+## Commands
 
 ```bash
-.venv/bin/python scripts/bootstrap_telegram_web.py \
-  --profile-path /absolute/private/telegram-profile --headed
-```
-
-Headless QR/login screenshot (scan it from a trusted device, then check status):
-
-```bash
-.venv/bin/python scripts/bootstrap_telegram_web.py \
-  --profile-path /absolute/private/telegram-profile \
-  --headless-qr-screenshot /absolute/private/login.png
-.venv/bin/python scripts/bootstrap_telegram_web.py \
-  --profile-path /absolute/private/telegram-profile --check-login
-```
-
-`--check-login` reports only `valid` or `required`; it does not print chat names or messages. Delete a QR screenshot after use. Treat the entire browser profile as an account credential: do not commit, share, or broadly back it up.
-
-## Destination bot permissions and privacy
-
-Add the Bot API bot as an administrator in each configured forum supergroup. It needs permission to read topic messages, post/forward messages, and delete messages. Disable BotFather privacy mode so polling receives ordinary group messages. The bot ignores bot-authored messages and its own messages, but those checks do not replace least-privilege administration. If forwarding fails or returns no positive message ID, the original is never deleted.
-
-## Run
-
-```bash
-# Validates environment and YAML only; makes no Telegram connection
+# Validate environment and YAML without connecting to Telegram
 .venv/bin/music-bridge --check-config
 
-# Runs one configured delivery; moderation polling is not started
+# Run exactly one configured Topic
 .venv/bin/music-bridge --run-once rock
 
-# Scheduler and moderation polling in one process
+# Run scheduler and optional moderation
 .venv/bin/music-bridge
 ```
 
-Shutdown stops scheduled intake, cancels/drains active delivery jobs, stops aiogram polling and drains its handlers, then closes the Bot session and browser context.
+## Docker
 
-## Telegram Web selector limitation
+The image contains Python, Playwright's driver, system Chromium plus Debian's
+`chromium-sandbox` helper, `yt-dlp`, and `ffmpeg`. It runs as non-root UID
+`10001`, is read-only except for bounded state/tmp mounts, drops all Linux
+capabilities, then restores only `SYS_CHROOT` for Chromium's sandbox. It has no
+persistent browser/profile volume. Compose intentionally does not set
+`no-new-privileges`: Chromium's root-owned setuid sandbox helper needs that bit
+clear to enter its sandbox before dropping privileges. Chromium is launched with
+Playwright `chromium_sandbox=True` and never with `--no-sandbox`.
 
-Telegram Web exposes no supported automation DOM contract. Role/ARIA and `data-*` selector fallbacks are centralized in `TelegramWebSelectors`; they deliberately avoid positional/nth-child-only selection. Selector misses, authentication requirements, timeouts, and download failures are surfaced as safe classified errors. The included selectors are **staging-verification-required** and have not been live-verified in this repository. Before production, use a private staging account and verify chat search, baseline capture, new media detection, and download after every Telegram Web update.
+Chromium's user-namespace sandbox also needs the checked-in Playwright seccomp
+profile and a host AppArmor profile based on Docker's default policy with only
+`userns` added. Install the AppArmor profile once on each Docker host (and again
+when that checked-in policy changes):
 
-## Docker Compose
+```bash
+sudo ./scripts/install-apparmor-profile.sh
+```
 
-The image is based on the matching Playwright `v1.55.0` image, runs as non-root UID 10001, drops all Linux capabilities, does not expose a remote-debugging port, and launches Chromium with container-safe `--no-sandbox` and `--disable-dev-shm-usage` flags. The browser profile has its own persistent volume.
+Do not replace the named profile with `apparmor=unconfined`. Compose fails closed
+when `hootbeatbot-chromium` is not loaded.
+
+The private `config/topics.yml` is excluded from the Docker build context. The
+image contains only `config/topics.example.yml`; deployment must bind-mount the
+real routing file at `/app/config/topics.yml`.
 
 ```bash
 docker compose build
-
-# Headless login screenshot in the private state volume
-docker compose run --rm bridge python scripts/bootstrap_telegram_web.py \
-  --headless-qr-screenshot /data/state/login/telegram-login.png
-# Copy/view that file only through a trusted local workflow, scan, then:
-docker compose run --rm bridge python scripts/bootstrap_telegram_web.py --check-login
 docker compose run --rm bridge music-bridge --check-config
 docker compose up -d
 ```
 
-For a headed container bootstrap, explicitly provide a trusted display socket; the default Compose service does not expose one. SQLite is for one replica only. Back up `/data/state/music_bridge.db` and the `telegram-profile` volume while stopped, and protect the profile backup as a secret.
+SQLite supports one service replica. Back up `/data/state/music_bridge.db` and `/data/state/soundcloud-catalog.json` while the service is stopped.
 
 ## Verification
 
@@ -113,9 +163,10 @@ For a headed container bootstrap, explicitly provide a trusted display socket; t
 .venv/bin/ruff check .
 .venv/bin/ruff format --check .
 .venv/bin/mypy src
-.venv/bin/python -m compileall -q src scripts
+.venv/bin/python -m compileall -q src
 sh -n scripts/docker-entrypoint.sh
 docker compose config
+docker compose build
 ```
 
-Unit tests use injected fake browser drivers and fake Bot API clients; they require no real Telegram credentials. A real staging run remains mandatory: verify the selectors, one source response after the request baseline, disk download, exact destination topic, moderation forwarding to exact General, delete-after-forward behavior, and clean temporary directories.
+A release is not complete until a real SoundCloud URL has been downloaded, probed, uploaded by HootBeatBot to the exact test Topic, and read back from Telegram.

@@ -6,6 +6,7 @@ import asyncio
 import logging
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 from music_bridge.domain import DestinationPublisher, DownloadedMedia, MusicSource, SourceRequest
 from music_bridge.repositories import Repository
@@ -38,12 +39,15 @@ class BridgeService:
         publisher: DestinationPublisher,
         max_media_bytes: int,
         workspace_root: Path,
+        *,
+        source_attempts: int = 1,
     ) -> None:
         self._repository = repository
         self._source = source
         self._publisher = publisher
         self._max_bytes = max_media_bytes
         self._workspace_root = workspace_root
+        self._source_attempts = source_attempts
 
     async def _record_failure(
         self,
@@ -72,45 +76,79 @@ class BridgeService:
         stage = "source"
         message_id: int | None = None
         try:
-            source_media = await self._source.request_track(SourceRequest(topic.render_request()))
-            stage = "download"
-            async with delivery_workspace(self._workspace_root) as workspace:
-                result = await download_bounded(
-                    source_media,
-                    self._source.iter_download(source_media),
-                    workspace,
-                    self._max_bytes,
+            excluded_source_ids = set(await self._repository.get_used_source_message_ids())
+            queries = topic.render_catalog_queries()
+            parsed_query = urlparse(queries[0].strip())
+            direct_request = parsed_query.scheme in {
+                "http",
+                "https",
+            } and bool(parsed_query.netloc)
+            for _attempt in range(self._source_attempts):
+                stage = "source"
+                source_media = await self._source.request_track(
+                    SourceRequest(
+                        queries[0],
+                        frozenset(excluded_source_ids),
+                        queries if len(queries) > 1 else (),
+                    )
                 )
-                track_id = await self._repository.claim_track_for_publish(
-                    delivery.id,
-                    source_chat_id=source_media.source_chat_id,
-                    source_message_id=source_media.source_message_id,
-                    content_sha256=result.sha256,
-                    title=source_media.title,
-                    performer=source_media.performer,
-                    file_name=source_media.file_name,
-                    mime_type=source_media.mime_type,
-                    file_size=result.size,
-                )
-                if track_id is None:
-                    await self._repository.mark_duplicate(delivery.id)
-                    return "skipped_duplicate"
-                downloaded = DownloadedMedia(
-                    source=source_media,
-                    path=result.path,
-                    size=result.size,
-                    sha256=result.sha256,
-                )
-                stage = "publishing"
-                message_id = await self._publisher.publish(
-                    topic.chat_id,
-                    topic.message_thread_id,
-                    downloaded,
-                    topic.genre,
-                )
-                stage = "published"
-                await self._repository.mark_success(delivery.id, track_id, message_id)
-                return "succeeded"
+                primary_error: BaseException | None = None
+                try:
+                    stage = "download"
+                    async with delivery_workspace(self._workspace_root) as workspace:
+                        result = await download_bounded(
+                            source_media,
+                            self._source.iter_download(source_media),
+                            workspace,
+                            self._max_bytes,
+                        )
+                        track_id = await self._repository.claim_track_for_publish(
+                            delivery.id,
+                            source_chat_id=source_media.source_chat_id,
+                            source_message_id=source_media.source_message_id,
+                            content_sha256=result.sha256,
+                            title=source_media.title,
+                            performer=source_media.performer,
+                            file_name=source_media.file_name,
+                            mime_type=source_media.mime_type,
+                            file_size=result.size,
+                        )
+                        if track_id is None:
+                            excluded_source_ids.add(source_media.source_message_id)
+                            if direct_request:
+                                break
+                            continue
+                        downloaded = DownloadedMedia(
+                            source=source_media,
+                            path=result.path,
+                            size=result.size,
+                            sha256=result.sha256,
+                        )
+                        stage = "publishing"
+                        message_id = await self._publisher.publish(
+                            topic.chat_id,
+                            topic.message_thread_id,
+                            downloaded,
+                            topic.genre,
+                        )
+                        stage = "published"
+                        await self._repository.mark_success(delivery.id, track_id, message_id)
+                        return "succeeded"
+                except BaseException as exc:
+                    primary_error = exc
+                    raise
+                finally:
+                    try:
+                        await self._source.discard(source_media)
+                    except BaseException as discard_error:
+                        if primary_error is None:
+                            raise
+                        logger.error(
+                            "source discard failed while preserving primary failure (%s)",
+                            type(discard_error).__name__,
+                        )
+            await self._repository.mark_duplicate(delivery.id)
+            return "skipped_duplicate"
         except asyncio.CancelledError:
             detail = (
                 "cancelled_during_publish" if stage in {"publishing", "published"} else "cancelled"

@@ -17,6 +17,8 @@ class MediaKind(StrEnum):
 @dataclass(frozen=True, slots=True)
 class SourceRequest:
     query: str
+    excluded_source_message_ids: frozenset[int] = frozenset()
+    catalog_queries: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +31,7 @@ class SourceMedia:
     size: int | None
     title: str | None = None
     performer: str | None = None
+    duration_seconds: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +46,8 @@ class MusicSource(Protocol):
     async def request_track(self, request: SourceRequest) -> SourceMedia: ...
 
     def iter_download(self, media: SourceMedia) -> AsyncIterator[bytes]: ...
+
+    async def discard(self, media: SourceMedia) -> None: ...
 
 
 class DestinationPublisher(Protocol):
